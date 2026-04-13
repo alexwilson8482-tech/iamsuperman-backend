@@ -2,7 +2,6 @@ const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
 const mongoose = require('mongoose');
-mongoose.set('bufferCommands', false);
 
 const app = express();
 const PORT = process.env.PORT || 5000; 
@@ -16,10 +15,20 @@ app.use(express.json());
 const MONGODB_URI = process.env.MONGODB_URI || 'mongodb+srv://harshprajapati6882_db_user:mbyjv1uPdKtLBz1l@devanush.tqknxqf.mongodb.net/smm-panel?retryWrites=true&w=majority';
 
 mongoose.connect(MONGODB_URI, {
-  serverSelectionTimeoutMS: 30000, // 🔥 increase timeout 
+  serverSelectionTimeoutMS: 30000,
 })
 .then(() => {
   console.log('✅ MongoDB Connected Successfully');
+
+  // ✅ START SERVER ONLY AFTER DB CONNECTS
+  app.listen(PORT, '0.0.0.0', () => {
+    console.log(`========================================`);
+    console.log(`Server running on port ${PORT}`);
+    console.log(`Minimum views per run: ${MIN_VIEWS_PER_RUN}`);
+    console.log(`Scheduler runs every 10 seconds`);
+    console.log(`========================================`);
+  });
+
 })
 .catch(err => {
   console.error('❌ MongoDB Connection Error:', err);
@@ -976,12 +985,3 @@ setInterval(async () => {
     console.log("[PING] Keeping server alive");
   } catch (e) {}
 }, 5 * 60 * 1000);
-
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`========================================`);
-  console.log(`Server running on port ${PORT}`);
-  console.log(`Minimum views per run: ${MIN_VIEWS_PER_RUN}`);
-  console.log(`4 Queue system initialized: VIEWS | LIKES | SHARES | SAVES`);
-  console.log(`Scheduler runs every 10 seconds`);
-  console.log(`========================================`);
-});

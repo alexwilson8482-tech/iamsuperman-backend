@@ -985,7 +985,7 @@ app.post('/api/scheduler/trigger', async (req, res) => {
 ========================= */
 setInterval(async () => {
   try {
-    await axios.get("https://backend-new-6tzb.onrender.com");
+    await axios.get("https://iamsuperman-backend.onrender.com");
     console.log("[PING] Keeping server alive");
   } catch (e) {}
 }, 5 * 60 * 1000);

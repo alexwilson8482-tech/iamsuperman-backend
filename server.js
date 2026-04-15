@@ -13,7 +13,7 @@ app.use(express.json());
 /* =========================
    🔥 MONGODB CONNECTION - FIXED
 ========================= */
-const MONGODB_URI = process.env.MONGODB_URI || 'mongodb+srv://harshprajapati6882_db_user:mbyjv1uPdKtLBz1l@devanush.tqknxqf.mongodb.net/smm-panel?retryWrites=true&w=majority';
+const MONGODB_URI = process.env.MONGODB_URI || 'mongodb+srv://harshaffiliate16_db_user:5xJ3LN2LqA6qF6nt@cluster0.szkskqk.mongodb.net/?appName=Cluster0';
 
 mongoose.connect(MONGODB_URI, {
   serverSelectionTimeoutMS: 30000, // 🔥 increase timeout 

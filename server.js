@@ -2,7 +2,6 @@ const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
 const mongoose = require('mongoose');
-mongoose.set('bufferCommands', false);
 
 const app = express();
 const PORT = process.env.PORT || 5000; 
@@ -16,11 +15,36 @@ app.use(express.json());
 const MONGODB_URI = process.env.MONGODB_URI || 'mongodb+srv://harshaffiliate16_db_user:5xJ3LN2LqA6qF6nt@cluster0.szkskqk.mongodb.net/?appName=Cluster0';
 
 mongoose.connect(MONGODB_URI, {
-  serverSelectionTimeoutMS: 30000, // 🔥 increase timeout 
+  serverSelectionTimeoutMS: 30000,
 })
-.then(() => {
+.then(async () => {
   console.log('✅ MongoDB Connected Successfully');
+
+  // Clean stuck runs on startup
+  try {
+    const cleanResult = await Run.updateMany(
+      { status: 'processing', executedAt: null },
+      { $set: { status: 'pending' } }
+    );
+    if (cleanResult.modifiedCount > 0) {
+      console.log(`✅ Cleaned ${cleanResult.modifiedCount} stuck runs on startup`);
+    }
+  } catch (err) {
+    console.error('Warning: Could not clean stuck runs:', err.message);
+  }
+
+  // ✅ START SERVER ONLY AFTER DB CONNECTS
+  app.listen(PORT, '0.0.0.0', () => {
+    console.log(`========================================`);
+    console.log(`Server running on port ${PORT}`);
+    console.log(`Minimum views per run: ${MIN_VIEWS_PER_RUN}`);
+    console.log(`Scheduler runs every 10 seconds`);
+    console.log(`========================================`);
+  });
 })
+.catch(err => {
+  console.error('❌ MongoDB Connection Error:', err);
+});
 .catch(err => {
   console.error('❌ MongoDB Connection Error:', err);
 });
@@ -978,11 +1002,3 @@ setInterval(async () => {
 }, 5 * 60 * 1000);
 
 
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`========================================`);
-  console.log(`Server running on port ${PORT}`);
-  console.log(`Minimum views per run: ${MIN_VIEWS_PER_RUN}`);
-  console.log(`4 Queue system initialized: VIEWS | LIKES | SHARES | SAVES`);
-  console.log(`Scheduler runs every 10 seconds`);
-  console.log(`========================================`);
-});

@@ -45,9 +45,6 @@ mongoose.connect(MONGODB_URI, {
 .catch(err => {
   console.error('❌ MongoDB Connection Error:', err);
 });
-.catch(err => {
-  console.error('❌ MongoDB Connection Error:', err);
-});
 
 /* =========================
    🔥 MONGODB SCHEMAS

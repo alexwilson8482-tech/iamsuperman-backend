@@ -103,6 +103,10 @@ let isExecutingShares = false;
 let isExecutingSaves = false;
 let isExecutingComments = false;
 
+// 🔥 Cooldown tracker - prevents sending same link+label too fast
+const lastExecutionTime = new Map();
+const MIN_COOLDOWN_MS = 10 * 60 * 1000; // 10 minutes
+
 /* =========================
    PLACE ORDER
 ========================= */
@@ -205,43 +209,47 @@ else {
    EXECUTE RUN
 ========================= */
 async function executeRun(run) {
-   // 🔥 STOP IF ORDER CANCELLED
-const order = await Order.findOne({ schedulerOrderId: run.schedulerOrderId });
-   if (run.status === 'cancelled') {
-  console.log(`[SKIP] Run already cancelled`);
-  return;
-}
+  // 🔥 STOP IF ORDER CANCELLED
+  const order = await Order.findOne({ schedulerOrderId: run.schedulerOrderId });
+  if (run.status === 'cancelled') {
+    console.log(`[SKIP] Run already cancelled`);
+    return;
+  }
+  if (!order || order.status === 'cancelled') {
+    console.log(`[SKIP] Order cancelled → run skipped`);
+    return;
+  }
 
-if (!order || order.status === 'cancelled') {
-  console.log(`[SKIP] Order cancelled → run skipped`);
-  return;
-}
   try {
-     // 🔥 clean stuck runs (IMPORTANT)
-await Run.updateMany(
-  { status: 'processing', executedAt: null },
-  { $set: { status: 'failed' } }
-);
-     // 🔒 prevent same-type duplicate orders (IMPORTANT)
-const activeSameType = await Run.findOne({
-  link: run.link,
-  label: run.label,
-  status: { $in: ['processing'] },
-  schedulerOrderId: run.schedulerOrderId // 🔥 THIS IS THE FIX
-});
+    // 🔥 FIX 1: Only clean truly stuck runs (older than 15 min with no executedAt)
+    const fifteenMinAgo = new Date(Date.now() - 15 * 60 * 1000);
+    await Run.updateMany(
+      {
+        status: 'processing',
+        executedAt: null,
+        createdAt: { $lt: fifteenMinAgo }
+      },
+      { $set: { status: 'failed', error: 'Stuck run cleaned up' } }
+    );
 
-if (activeSameType && activeSameType._id.toString() !== run._id.toString()) {
-  console.log(`[${run.label}] Skipping - same type already active for this link`);
+    // 🔥 FIX 2: Check across ALL orders for same link+label (not just same order)
+    const activeSameType = await Run.findOne({
+      link: run.link,
+      label: run.label,
+      status: { $in: ['processing'] },
+      _id: { $ne: run._id }
+    });
 
-  // push back to queue
-  if (run.label === 'VIEWS') viewsQueue.push(run);
-  if (run.label === 'LIKES') likesQueue.push(run);
-  if (run.label === 'SHARES') sharesQueue.push(run);
-  if (run.label === 'SAVES') savesQueue.push(run);
-  if (run.label === 'COMMENTS') commentsQueue.push(run);
+    if (activeSameType) {
+      console.log(`[${run.label}] Skipping - same type already processing for this link`);
+      if (run.label === 'VIEWS') viewsQueue.push(run);
+      if (run.label === 'LIKES') likesQueue.push(run);
+      if (run.label === 'SHARES') sharesQueue.push(run);
+      if (run.label === 'SAVES') savesQueue.push(run);
+      if (run.label === 'COMMENTS') commentsQueue.push(run);
+      return;
+    }
 
-  return;
-}
     if (!run || !run._id) {
       console.warn(`[${run?.label}] Invalid run, skipping`);
       return;
@@ -251,7 +259,6 @@ if (activeSameType && activeSameType._id.toString() !== run._id.toString()) {
 
     console.log(`[${run.label}] Executing run #${run.id}, quantity: ${run.quantity}`);
 
-    // 🔥 SAFE UPDATE (no version conflict)
     await Run.updateOne(
       { _id: run._id },
       { $set: { status: 'processing' } }
@@ -260,24 +267,23 @@ if (activeSameType && activeSameType._id.toString() !== run._id.toString()) {
     await updateOrderStatus(run.schedulerOrderId);
 
     let payload = {
-  apiUrl: run.apiUrl,
-  apiKey: run.apiKey,
-  service: run.service,
-  link: run.link,
-};
+      apiUrl: run.apiUrl,
+      apiKey: run.apiKey,
+      service: run.service,
+      link: run.link,
+    };
 
-if (run.label === 'COMMENTS') {
-  payload.comments = run.comments;
-  payload.quantity = run.quantity;
-} else {
-  payload.quantity = run.quantity;
-}
+    if (run.label === 'COMMENTS') {
+      payload.comments = run.comments;
+      payload.quantity = run.quantity;
+    } else {
+      payload.quantity = run.quantity;
+    }
 
-const result = await placeOrder(payload);
+    const result = await placeOrder(payload);
 
     if (result?.order) {
       console.log(`[${run.label}] SUCCESS - SMM Order ID: ${result.order}`);
-
       await Run.updateOne(
         { _id: run._id },
         {
@@ -289,34 +295,57 @@ const result = await placeOrder(payload);
           }
         }
       );
-
     } else {
       console.error(`[${run.label}] FAILED`, result);
+      const errorMsg = result?.error || 'Unknown error';
 
-      await Run.updateOne(
-        { _id: run._id },
-        {
-          $set: {
-            status: 'failed',
-            error: result?.error || 'Unknown error'
+      // 🔥 FIX 3: If provider says active order exists, retry after 5 min
+      if (errorMsg.toLowerCase().includes('active order') ||
+          errorMsg.toLowerCase().includes('wait until')) {
+        console.log(`[${run.label}] Provider busy - resetting to pending, retry in 5 min`);
+        await Run.updateOne(
+          { _id: run._id },
+          {
+            $set: {
+              status: 'pending',
+              error: null,
+              time: new Date(Date.now() + 5 * 60 * 1000)
+            }
           }
-        }
-      );
+        );
+      } else {
+        await Run.updateOne(
+          { _id: run._id },
+          { $set: { status: 'failed', error: errorMsg } }
+        );
+      }
     }
 
   } catch (err) {
     console.error(`[${run.label}] ERROR`, err.response?.data || err.message);
+    const errorMsg = err.response?.data?.error || err.message;
 
     if (run?._id) {
-      await Run.updateOne(
-        { _id: run._id },
-        {
-          $set: {
-            status: 'failed',
-            error: err.response?.data?.error || err.message
+      // 🔥 FIX 4: Retry on provider busy error in catch block too
+      if (errorMsg?.toLowerCase?.()?.includes?.('active order') ||
+          errorMsg?.toLowerCase?.()?.includes?.('wait until')) {
+        console.log(`[${run.label}] Provider busy (catch) - resetting to pending`);
+        await Run.updateOne(
+          { _id: run._id },
+          {
+            $set: {
+              status: 'pending',
+              error: null,
+              time: new Date(Date.now() + 5 * 60 * 1000)
+            }
           }
-        }
-      );
+        );
+      } else {
+        await Run.updateOne(
+          { _id: run._id },
+          { $set: { status: 'failed', error: errorMsg } }
+        );
+      }
     }
   }
 
@@ -381,14 +410,26 @@ async function processViewsQueue() {
   console.log(`[VIEWS QUEUE] Processing run #${run.id}, Remaining: ${viewsQueue.length}`);
 
   try {
-    const freshRun = await Run.findById(run._id);
+    const cooldownKey = `${run.link}-${run.label}`;
+    const lastExec = lastExecutionTime.get(cooldownKey) || 0;
+    const timeSinceLast = Date.now() - lastExec;
 
+    if (timeSinceLast < MIN_COOLDOWN_MS) {
+      const waitMs = MIN_COOLDOWN_MS - timeSinceLast;
+      console.log(`[VIEWS QUEUE] Cooldown active, waiting ${Math.round(waitMs/1000)}s`);
+      viewsQueue.unshift(run);
+      isExecutingViews = false;
+      await new Promise(resolve => setTimeout(resolve, Math.min(waitMs, 60000)));
+      return;
+    }
+
+    const freshRun = await Run.findById(run._id);
     if (!freshRun || freshRun.status === 'cancelled') {
       console.log(`[VIEWS QUEUE] Skipped cancelled run`);
     } else {
+      lastExecutionTime.set(cooldownKey, Date.now());
       await executeRun(freshRun);
     }
-
   } catch (err) {
     console.error(`[VIEWS QUEUE] Error:`, err);
   }
@@ -410,14 +451,26 @@ async function processLikesQueue() {
   console.log(`[LIKES QUEUE] Processing run #${run.id}, Remaining: ${likesQueue.length}`);
 
   try {
-    const freshRun = await Run.findById(run._id);
+    const cooldownKey = `${run.link}-${run.label}`;
+    const lastExec = lastExecutionTime.get(cooldownKey) || 0;
+    const timeSinceLast = Date.now() - lastExec;
 
+    if (timeSinceLast < MIN_COOLDOWN_MS) {
+      const waitMs = MIN_COOLDOWN_MS - timeSinceLast;
+      console.log(`[LIKES QUEUE] Cooldown active, waiting ${Math.round(waitMs/1000)}s`);
+      likesQueue.unshift(run);
+      isExecutingLikes = false;
+      await new Promise(resolve => setTimeout(resolve, Math.min(waitMs, 60000)));
+      return;
+    }
+
+    const freshRun = await Run.findById(run._id);
     if (!freshRun || freshRun.status === 'cancelled') {
       console.log(`[LIKES QUEUE] Skipped cancelled run`);
     } else {
+      lastExecutionTime.set(cooldownKey, Date.now());
       await executeRun(freshRun);
     }
-
   } catch (err) {
     console.error(`[LIKES QUEUE] Error:`, err);
   }
@@ -439,14 +492,26 @@ async function processSharesQueue() {
   console.log(`[SHARES QUEUE] Processing run #${run.id}, Remaining: ${sharesQueue.length}`);
 
   try {
-    const freshRun = await Run.findById(run._id);
+    const cooldownKey = `${run.link}-${run.label}`;
+    const lastExec = lastExecutionTime.get(cooldownKey) || 0;
+    const timeSinceLast = Date.now() - lastExec;
 
+    if (timeSinceLast < MIN_COOLDOWN_MS) {
+      const waitMs = MIN_COOLDOWN_MS - timeSinceLast;
+      console.log(`[SHARES QUEUE] Cooldown active, waiting ${Math.round(waitMs/1000)}s`);
+      sharesQueue.unshift(run);
+      isExecutingShares = false;
+      await new Promise(resolve => setTimeout(resolve, Math.min(waitMs, 60000)));
+      return;
+    }
+
+    const freshRun = await Run.findById(run._id);
     if (!freshRun || freshRun.status === 'cancelled') {
       console.log(`[SHARES QUEUE] Skipped cancelled run`);
     } else {
+      lastExecutionTime.set(cooldownKey, Date.now());
       await executeRun(freshRun);
     }
-
   } catch (err) {
     console.error(`[SHARES QUEUE] Error:`, err);
   }
@@ -458,7 +523,6 @@ async function processSharesQueue() {
     setImmediate(() => processSharesQueue());
   }
 }
-
 async function processSavesQueue() {
   if (isExecutingSaves || savesQueue.length === 0) return;
 
@@ -468,14 +532,26 @@ async function processSavesQueue() {
   console.log(`[SAVES QUEUE] Processing run #${run.id}, Remaining: ${savesQueue.length}`);
 
   try {
-    const freshRun = await Run.findById(run._id);
+    const cooldownKey = `${run.link}-${run.label}`;
+    const lastExec = lastExecutionTime.get(cooldownKey) || 0;
+    const timeSinceLast = Date.now() - lastExec;
 
+    if (timeSinceLast < MIN_COOLDOWN_MS) {
+      const waitMs = MIN_COOLDOWN_MS - timeSinceLast;
+      console.log(`[SAVES QUEUE] Cooldown active, waiting ${Math.round(waitMs/1000)}s`);
+      savesQueue.unshift(run);
+      isExecutingSaves = false;
+      await new Promise(resolve => setTimeout(resolve, Math.min(waitMs, 60000)));
+      return;
+    }
+
+    const freshRun = await Run.findById(run._id);
     if (!freshRun || freshRun.status === 'cancelled') {
       console.log(`[SAVES QUEUE] Skipped cancelled run`);
     } else {
+      lastExecutionTime.set(cooldownKey, Date.now());
       await executeRun(freshRun);
     }
-
   } catch (err) {
     console.error(`[SAVES QUEUE] Error:`, err);
   }
@@ -497,14 +573,26 @@ async function processCommentsQueue() {
   console.log(`[COMMENTS QUEUE] Processing run #${run.id}, Remaining: ${commentsQueue.length}`);
 
   try {
-    const freshRun = await Run.findById(run._id);
+    const cooldownKey = `${run.link}-${run.label}`;
+    const lastExec = lastExecutionTime.get(cooldownKey) || 0;
+    const timeSinceLast = Date.now() - lastExec;
 
+    if (timeSinceLast < MIN_COOLDOWN_MS) {
+      const waitMs = MIN_COOLDOWN_MS - timeSinceLast;
+      console.log(`[COMMENTS QUEUE] Cooldown active, waiting ${Math.round(waitMs/1000)}s`);
+      commentsQueue.unshift(run);
+      isExecutingComments = false;
+      await new Promise(resolve => setTimeout(resolve, Math.min(waitMs, 60000)));
+      return;
+    }
+
+    const freshRun = await Run.findById(run._id);
     if (!freshRun || freshRun.status === 'cancelled') {
       console.log(`[COMMENTS QUEUE] Skipped cancelled run`);
     } else {
+      lastExecutionTime.set(cooldownKey, Date.now());
       await executeRun(freshRun);
     }
-
   } catch (err) {
     console.error(`[COMMENTS QUEUE] Error:`, err);
   }

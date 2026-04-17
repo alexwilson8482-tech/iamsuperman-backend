@@ -10,41 +10,9 @@ app.use(cors());
 app.use(express.json());
 
 /* =========================
-   🔥 MONGODB CONNECTION - FIXED
+   🔥 MONGODB CONNECTION
 ========================= */
 const MONGODB_URI = process.env.MONGODB_URI || 'mongodb+srv://harshaffiliate16_db_user:5xJ3LN2LqA6qF6nt@cluster0.szkskqk.mongodb.net/?appName=Cluster0';
-
-mongoose.connect(MONGODB_URI, {
-  serverSelectionTimeoutMS: 30000,
-})
-.then(async () => {
-  console.log('✅ MongoDB Connected Successfully');
-
-  // Clean stuck runs on startup
-  try {
-    const cleanResult = await Run.updateMany(
-      { status: 'processing', executedAt: null },
-      { $set: { status: 'pending' } }
-    );
-    if (cleanResult.modifiedCount > 0) {
-      console.log(`✅ Cleaned ${cleanResult.modifiedCount} stuck runs on startup`);
-    }
-  } catch (err) {
-    console.error('Warning: Could not clean stuck runs:', err.message);
-  }
-
-  // ✅ START SERVER ONLY AFTER DB CONNECTS
-  app.listen(PORT, '0.0.0.0', () => {
-    console.log(`========================================`);
-    console.log(`Server running on port ${PORT}`);
-    console.log(`Minimum views per run: ${MIN_VIEWS_PER_RUN}`);
-    console.log(`Scheduler runs every 10 seconds`);
-    console.log(`========================================`);
-  });
-})
-.catch(err => {
-  console.error('❌ MongoDB Connection Error:', err);
-});
 
 /* =========================
    🔥 MONGODB SCHEMAS
@@ -89,7 +57,7 @@ const Order = mongoose.model('Order', OrderSchema);
 let MIN_VIEWS_PER_RUN = 100;
 
 /* =========================
-   🔥 4 SEPARATE QUEUES + FLAGS
+   🔥 5 SEPARATE QUEUES + FLAGS
 ========================= */
 let viewsQueue = [];
 let likesQueue = [];
@@ -108,6 +76,50 @@ const lastExecutionTime = new Map();
 const MIN_COOLDOWN_MS = 10 * 60 * 1000; // 10 minutes
 
 /* =========================
+   🔥 START SERVER FIRST
+   So Render always detects port
+========================= */
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`========================================`);
+  console.log(`Server running on port ${PORT}`);
+  console.log(`Minimum views per run: ${MIN_VIEWS_PER_RUN}`);
+  console.log(`Scheduler runs every 10 seconds`);
+  console.log(`========================================`);
+});
+
+/* =========================
+   🔥 THEN CONNECT MONGODB
+========================= */
+mongoose.connect(MONGODB_URI, {
+  serverSelectionTimeoutMS: 30000,
+})
+.then(async () => {
+  console.log('✅ MongoDB Connected Successfully');
+
+  // 🔥 Clean truly stuck runs on startup (older than 15 min)
+  try {
+    const fifteenMinAgo = new Date(Date.now() - 15 * 60 * 1000);
+    const cleanResult = await Run.updateMany(
+      { 
+        status: 'processing', 
+        executedAt: null,
+        createdAt: { $lt: fifteenMinAgo }
+      },
+      { $set: { status: 'pending', error: null } }
+    );
+    if (cleanResult.modifiedCount > 0) {
+      console.log(`✅ Cleaned ${cleanResult.modifiedCount} stuck runs on startup`);
+    }
+  } catch (err) {
+    console.error('Warning: Could not clean stuck runs:', err.message);
+  }
+})
+.catch(err => {
+  console.error('❌ MongoDB Connection Error:', err);
+  console.log('⚠️ Server running but database not connected');
+});
+
+/* =========================
    PLACE ORDER
 ========================= */
 async function placeOrder({ apiUrl, apiKey, service, link, quantity, comments }) {
@@ -119,7 +131,6 @@ async function placeOrder({ apiUrl, apiKey, service, link, quantity, comments })
     quantity: String(quantity),
   });
 
-  // 🔥 ADD THIS
   if (comments) {
     params.append('comments', comments);
   }
@@ -130,6 +141,7 @@ async function placeOrder({ apiUrl, apiKey, service, link, quantity, comments })
 
   return response.data;
 }
+
 /* =========================
    ADD RUNS TO DATABASE
 ========================= */
@@ -140,44 +152,43 @@ async function addRuns(services, baseConfig, schedulerOrderId) {
     if (!serviceConfig) continue;
 
     const label = key.toUpperCase();
-    const isViewService = label === 'VIEWS';
 
     for (const run of serviceConfig.runs) {
       let quantity;
 
-// VIEWS
-if (label === 'VIEWS') {
-  if (!run.quantity || run.quantity < 100) continue;
-  quantity = run.quantity;
-}
+      // VIEWS
+      if (label === 'VIEWS') {
+        if (!run.quantity || run.quantity < 100) continue;
+        quantity = run.quantity;
+      }
 
-// COMMENTS
-else if (label === 'COMMENTS') {
-  if (!run.comments) continue;
+      // COMMENTS
+      else if (label === 'COMMENTS') {
+        if (!run.comments) continue;
 
-  let lines = run.comments
-    .split('\n')
-    .map(c => c.trim())
-    .filter(c => c.length > 0);
+        let lines = run.comments
+          .split('\n')
+          .map(c => c.trim())
+          .filter(c => c.length > 0);
 
-  if (lines.length < 5) continue;
+        // 🔥 minimum 1 line (was 5, too strict)
+        if (lines.length < 1) continue;
 
-  // 🔥 LIMIT MAX TO 10
-  if (lines.length > 10) {
-  lines = lines.sort(() => Math.random() - 0.5).slice(0, 10);
-}
+        // 🔥 Limit max to 10
+        if (lines.length > 10) {
+          lines = lines.sort(() => Math.random() - 0.5).slice(0, 10);
+        }
 
-  // 🔥 UPDATE COMMENTS AFTER TRIM
-  run.comments = lines.join('\n');
+        run.comments = lines.join('\n');
+        quantity = lines.length;
+      }
 
-  quantity = lines.length;
-}
+      // OTHERS (likes, shares, saves)
+      else {
+        if (!run.quantity || run.quantity <= 0) continue;
+        quantity = run.quantity;
+      }
 
-// OTHERS (likes, shares, saves)
-else {
-  if (!run.quantity || run.quantity <= 0) continue;
-  quantity = run.quantity;
-}
       const runData = new Run({
         id: Date.now() + Math.random(),
         schedulerOrderId,
@@ -363,39 +374,50 @@ async function updateOrderStatus(schedulerOrderId) {
 
   if (!order) return;
 
+  // 🔥 Don't overwrite cancelled orders
+  if (order.status === 'cancelled') return;
+
   const totalRuns = orderRuns.length;
   const completedRuns = orderRuns.filter(r => r.status === 'completed').length;
   const failedRuns = orderRuns.filter(r => r.status === 'failed').length;
+  const cancelledRuns = orderRuns.filter(r => r.status === 'cancelled').length;
   const processingRuns = orderRuns.filter(r => r.status === 'processing').length;
   const queuedRuns = orderRuns.filter(r => r.status === 'queued').length;
+  const pausedRuns = orderRuns.filter(r => r.status === 'paused').length;
+  const pendingRuns = orderRuns.filter(r => r.status === 'pending').length;
 
-  if (completedRuns === totalRuns) {
-    order.status = 'completed';
-  } else if (failedRuns === totalRuns) {
-    order.status = 'failed';
+  const activeRuns = totalRuns - cancelledRuns;
+
+  let newStatus;
+
+  if (activeRuns === 0) {
+    newStatus = 'cancelled';
+  } else if (completedRuns === activeRuns) {
+    newStatus = 'completed';
+  } else if (failedRuns === activeRuns) {
+    newStatus = 'failed';
+  } else if (pausedRuns > 0 && processingRuns === 0 && queuedRuns === 0) {
+    newStatus = 'paused';
   } else if (processingRuns > 0 || completedRuns > 0 || queuedRuns > 0) {
-    order.status = 'running';
+    newStatus = 'running';
+  } else if (pendingRuns > 0) {
+    newStatus = 'pending';
   } else {
-    order.status = 'pending';
+    newStatus = order.status;
   }
-
-  order.completedRuns = completedRuns;
-  order.totalRuns = totalRuns;
-  order.lastUpdatedAt = new Date();
-  order.runStatuses = orderRuns.map(r => r.status);
 
   await Order.updateOne(
-  { schedulerOrderId },
-  {
-    $set: {
-      status: order.status,
-      completedRuns: order.completedRuns,
-      totalRuns: order.totalRuns,
-      lastUpdatedAt: new Date(),
-      runStatuses: order.runStatuses
+    { schedulerOrderId },
+    {
+      $set: {
+        status: newStatus,
+        completedRuns,
+        totalRuns,
+        lastUpdatedAt: new Date(),
+        runStatuses: orderRuns.map(r => r.status)
+      }
     }
-  }
-);
+  );
 }
 
 /* =========================
@@ -420,6 +442,8 @@ async function processViewsQueue() {
       viewsQueue.unshift(run);
       isExecutingViews = false;
       await new Promise(resolve => setTimeout(resolve, Math.min(waitMs, 60000)));
+      // 🔥 Resume queue after cooldown
+      if (viewsQueue.length > 0) setImmediate(() => processViewsQueue());
       return;
     }
 
@@ -461,6 +485,8 @@ async function processLikesQueue() {
       likesQueue.unshift(run);
       isExecutingLikes = false;
       await new Promise(resolve => setTimeout(resolve, Math.min(waitMs, 60000)));
+      // 🔥 Resume queue after cooldown
+      if (likesQueue.length > 0) setImmediate(() => processLikesQueue());
       return;
     }
 
@@ -502,6 +528,8 @@ async function processSharesQueue() {
       sharesQueue.unshift(run);
       isExecutingShares = false;
       await new Promise(resolve => setTimeout(resolve, Math.min(waitMs, 60000)));
+      // 🔥 Resume queue after cooldown
+      if (sharesQueue.length > 0) setImmediate(() => processSharesQueue());
       return;
     }
 
@@ -523,6 +551,7 @@ async function processSharesQueue() {
     setImmediate(() => processSharesQueue());
   }
 }
+
 async function processSavesQueue() {
   if (isExecutingSaves || savesQueue.length === 0) return;
 
@@ -542,6 +571,8 @@ async function processSavesQueue() {
       savesQueue.unshift(run);
       isExecutingSaves = false;
       await new Promise(resolve => setTimeout(resolve, Math.min(waitMs, 60000)));
+      // 🔥 Resume queue after cooldown
+      if (savesQueue.length > 0) setImmediate(() => processSavesQueue());
       return;
     }
 
@@ -583,6 +614,8 @@ async function processCommentsQueue() {
       commentsQueue.unshift(run);
       isExecutingComments = false;
       await new Promise(resolve => setTimeout(resolve, Math.min(waitMs, 60000)));
+      // 🔥 Resume queue after cooldown
+      if (commentsQueue.length > 0) setImmediate(() => processCommentsQueue());
       return;
     }
 
@@ -604,6 +637,7 @@ async function processCommentsQueue() {
     setImmediate(() => processCommentsQueue());
   }
 }
+
 /* =========================
    CHECK IF RUN IN QUEUE
 ========================= */
@@ -622,76 +656,73 @@ mongoose.connection.once('open', () => {
   console.log("🚀 Scheduler started after DB connected");
 
   setInterval(async () => {
-  try {
-    const now = Date.now();
-    let addedToQueue = { views: 0, likes: 0, shares: 0, saves: 0, comments: 0 };
+    try {
+      const now = Date.now();
+      let addedToQueue = { views: 0, likes: 0, shares: 0, saves: 0, comments: 0 };
 
-    const allRuns = await Run.find({ 
-      done: false,
-      status: { $nin: ['completed', 'failed', 'cancelled', 'processing'] }
-    });
+      const allRuns = await Run.find({ 
+        done: false,
+        status: { $nin: ['completed', 'failed', 'cancelled', 'processing'] }
+      });
 
-    for (let run of allRuns) {
-      if (run.status === 'queued' || isRunInQueue(run.id)) continue;
-      const order = await Order.findOne({ schedulerOrderId: run.schedulerOrderId });
+      for (let run of allRuns) {
+        if (run.status === 'queued' || isRunInQueue(run.id)) continue;
 
-if (!order || order.status === 'cancelled') {
-  continue; // 🔥 DO NOT ADD TO QUEUE
-}
-
-      const runTime = new Date(run.time).getTime();
-
-      if (runTime <= now && run.status === 'pending') {
-        
-        if (run.label === 'VIEWS') {
-          viewsQueue.push(run);
-          run.status = 'queued';
-          await run.save();
-          addedToQueue.views++;
-          console.log(`[SCHEDULER] Added VIEWS run #${run.id} to queue (qty: ${run.quantity})`);
-        } 
-        else if (run.label === 'LIKES') {
-          likesQueue.push(run);
-          run.status = 'queued';
-          await run.save();
-          addedToQueue.likes++;
-          console.log(`[SCHEDULER] Added LIKES run #${run.id} to queue (qty: ${run.quantity})`);
-        } 
-        else if (run.label === 'SHARES') {
-          sharesQueue.push(run);
-          run.status = 'queued';
-          await run.save();
-          addedToQueue.shares++;
-          console.log(`[SCHEDULER] Added SHARES run #${run.id} to queue (qty: ${run.quantity})`);
-        } 
-        else if (run.label === 'SAVES') {
-          savesQueue.push(run);
-          run.status = 'queued';
-          await run.save();
-          addedToQueue.saves++;
-          console.log(`[SCHEDULER] Added SAVES run #${run.id} to queue (qty: ${run.quantity})`);
+        const order = await Order.findOne({ schedulerOrderId: run.schedulerOrderId });
+        if (!order || order.status === 'cancelled') {
+          continue;
         }
-        else if (run.label === 'COMMENTS') {
-  commentsQueue.push(run);
-  run.status = 'queued';
-  await run.save();
-  addedToQueue.comments++;
-}
+
+        const runTime = new Date(run.time).getTime();
+
+        if (runTime <= now && run.status === 'pending') {
+          if (run.label === 'VIEWS') {
+            viewsQueue.push(run);
+            run.status = 'queued';
+            await run.save();
+            addedToQueue.views++;
+            console.log(`[SCHEDULER] Added VIEWS run #${run.id} to queue (qty: ${run.quantity})`);
+          } else if (run.label === 'LIKES') {
+            likesQueue.push(run);
+            run.status = 'queued';
+            await run.save();
+            addedToQueue.likes++;
+            console.log(`[SCHEDULER] Added LIKES run #${run.id} to queue (qty: ${run.quantity})`);
+          } else if (run.label === 'SHARES') {
+            sharesQueue.push(run);
+            run.status = 'queued';
+            await run.save();
+            addedToQueue.shares++;
+            console.log(`[SCHEDULER] Added SHARES run #${run.id} to queue (qty: ${run.quantity})`);
+          } else if (run.label === 'SAVES') {
+            savesQueue.push(run);
+            run.status = 'queued';
+            await run.save();
+            addedToQueue.saves++;
+            console.log(`[SCHEDULER] Added SAVES run #${run.id} to queue (qty: ${run.quantity})`);
+          } else if (run.label === 'COMMENTS') {
+            commentsQueue.push(run);
+            run.status = 'queued';
+            await run.save();
+            addedToQueue.comments++;
+            console.log(`[SCHEDULER] Added COMMENTS run #${run.id} to queue (qty: ${run.quantity})`);
+          }
+        }
       }
-    }
 
-    if (addedToQueue.views + addedToQueue.likes + addedToQueue.shares + addedToQueue.saves > 0) {
-      console.log(`[SCHEDULER] Added to queues - Views: ${addedToQueue.views}, Likes: ${addedToQueue.likes}, Shares: ${addedToQueue.shares}, Saves: ${addedToQueue.saves}, Comments: ${addedToQueue.comments}`);
-    }
+      if (addedToQueue.views + addedToQueue.likes + addedToQueue.shares + addedToQueue.saves + addedToQueue.comments > 0) {
+        console.log(`[SCHEDULER] Added to queues - Views: ${addedToQueue.views}, Likes: ${addedToQueue.likes}, Shares: ${addedToQueue.shares}, Saves: ${addedToQueue.saves}, Comments: ${addedToQueue.comments}`);
+      }
 
-    if (viewsQueue.length > 0 && !isExecutingViews) processViewsQueue();
-    if (likesQueue.length > 0 && !isExecutingLikes) processLikesQueue();
-    if (sharesQueue.length > 0 && !isExecutingShares) processSharesQueue();
-    if (savesQueue.length > 0 && !isExecutingSaves) processSavesQueue();
-    if (commentsQueue.length > 0 && !isExecutingComments) processCommentsQueue();
-  } catch (error) {
-    console.error('[SCHEDULER] Error:', error);
-  }
+      if (viewsQueue.length > 0 && !isExecutingViews) processViewsQueue();
+      if (likesQueue.length > 0 && !isExecutingLikes) processLikesQueue();
+      if (sharesQueue.length > 0 && !isExecutingShares) processSharesQueue();
+      if (savesQueue.length > 0 && !isExecutingSaves) processSavesQueue();
+      if (commentsQueue.length > 0 && !isExecutingComments) processCommentsQueue();
+
+    } catch (error) {
+      console.error('[SCHEDULER] Error:', error);
+    }
   }, 10000);
 });
 
@@ -846,7 +877,7 @@ app.post('/api/order/control', async (req, res) => {
           run.status = 'cancelled';
           run.done = true;
           await run.save();
-          
+
           viewsQueue = viewsQueue.filter(r => r.id !== run.id);
           likesQueue = likesQueue.filter(r => r.id !== run.id);
           sharesQueue = sharesQueue.filter(r => r.id !== run.id);
@@ -870,11 +901,13 @@ app.post('/api/order/control', async (req, res) => {
         if (run.status === 'pending' || run.status === 'queued') {
           run.status = 'paused';
           await run.save();
-          
+
           viewsQueue = viewsQueue.filter(r => r.id !== run.id);
           likesQueue = likesQueue.filter(r => r.id !== run.id);
           sharesQueue = sharesQueue.filter(r => r.id !== run.id);
           savesQueue = savesQueue.filter(r => r.id !== run.id);
+          // 🔥 Fix: also remove from commentsQueue
+          commentsQueue = commentsQueue.filter(r => r.id !== run.id);
         }
       }
       order.status = 'paused';
@@ -966,19 +999,19 @@ app.get('/api/queues/status', (req, res) => {
       pending: sharesQueue.map(r => ({ id: r.id, quantity: r.quantity, time: r.time }))
     },
     saves: {
-  queueLength: savesQueue.length,
-  isExecuting: isExecutingSaves,
-  pending: savesQueue.map(r => ({ id: r.id, quantity: r.quantity, time: r.time }))
-},
-comments: {
-  queueLength: commentsQueue.length,
-  isExecuting: isExecutingComments,
-  pending: commentsQueue.map(r => ({
-    id: r.id,
-    quantity: r.quantity,
-    time: r.time
-  }))
-}
+      queueLength: savesQueue.length,
+      isExecuting: isExecutingSaves,
+      pending: savesQueue.map(r => ({ id: r.id, quantity: r.quantity, time: r.time }))
+    },
+    comments: {
+      queueLength: commentsQueue.length,
+      isExecuting: isExecutingComments,
+      pending: commentsQueue.map(r => ({
+        id: r.id,
+        quantity: r.quantity,
+        time: r.time
+      }))
+    }
   });
 });
 
@@ -1047,11 +1080,11 @@ app.post('/api/scheduler/trigger', async (req, res) => {
           await run.save();
           addedToQueue.saves++;
         } else if (run.label === 'COMMENTS') {
-  commentsQueue.push(run);
-  run.status = 'queued';
-  await run.save();
-  addedToQueue.comments++;
-}
+          commentsQueue.push(run);
+          run.status = 'queued';
+          await run.save();
+          addedToQueue.comments++;
+        }
       }
     }
 
@@ -1068,7 +1101,8 @@ app.post('/api/scheduler/trigger', async (req, res) => {
         views: viewsQueue.length,
         likes: likesQueue.length,
         shares: sharesQueue.length,
-        saves: savesQueue.length
+        saves: savesQueue.length,
+        comments: commentsQueue.length
       }
     });
   } catch (error) {
@@ -1076,14 +1110,27 @@ app.post('/api/scheduler/trigger', async (req, res) => {
   }
 });
 
+app.get('/api/health', (req, res) => {
+  return res.json({
+    status: 'ok',
+    mongoConnected: mongoose.connection.readyState === 1,
+    uptime: process.uptime(),
+    queues: {
+      views: viewsQueue.length,
+      likes: likesQueue.length,
+      shares: sharesQueue.length,
+      saves: savesQueue.length,
+      comments: commentsQueue.length
+    }
+  });
+});
+
 /* =========================
-   START SERVER
+   KEEP ALIVE PING
 ========================= */
 setInterval(async () => {
   try {
-    await axios.get("https://iamsuperman-backend.onrender.com");
+    await axios.get("https://iamsuperman-backend.onrender.com/api/health");
     console.log("[PING] Keeping server alive");
   } catch (e) {}
 }, 5 * 60 * 1000);
-
-

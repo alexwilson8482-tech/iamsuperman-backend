@@ -48,13 +48,57 @@ const OrderSchema = new mongoose.Schema({
   lastUpdatedAt: { type: Date, default: Date.now },
 });
 
+// 🔥 NEW: Settings schema to persist MIN_VIEWS_PER_RUN in MongoDB
+const SettingsSchema = new mongoose.Schema({
+  key: { type: String, required: true, unique: true },
+  value: { type: mongoose.Schema.Types.Mixed, required: true },
+  updatedAt: { type: Date, default: Date.now },
+});
+
 const Run = mongoose.model('Run', RunSchema);
 const Order = mongoose.model('Order', OrderSchema);
+const Settings = mongoose.model('Settings', SettingsSchema);
 
 /* =========================
    MINIMUM VIEWS PER RUN
+   🔥 FIX: Now persisted in MongoDB
+   so it survives server restarts
 ========================= */
 let MIN_VIEWS_PER_RUN = 100;
+
+// 🔥 Load MIN_VIEWS_PER_RUN from MongoDB on startup
+async function loadSettings() {
+  try {
+    const setting = await Settings.findOne({ key: 'minViewsPerRun' });
+    if (setting && typeof setting.value === 'number' && setting.value >= 1) {
+      MIN_VIEWS_PER_RUN = setting.value;
+      console.log(`✅ Loaded MIN_VIEWS_PER_RUN from DB: ${MIN_VIEWS_PER_RUN}`);
+    } else {
+      // Save default value
+      await Settings.findOneAndUpdate(
+        { key: 'minViewsPerRun' },
+        { key: 'minViewsPerRun', value: MIN_VIEWS_PER_RUN, updatedAt: new Date() },
+        { upsert: true }
+      );
+      console.log(`✅ Saved default MIN_VIEWS_PER_RUN to DB: ${MIN_VIEWS_PER_RUN}`);
+    }
+  } catch (err) {
+    console.error('Warning: Could not load settings from DB:', err.message);
+  }
+}
+
+// 🔥 Save MIN_VIEWS_PER_RUN to MongoDB
+async function saveMinViewsSetting(value) {
+  try {
+    await Settings.findOneAndUpdate(
+      { key: 'minViewsPerRun' },
+      { key: 'minViewsPerRun', value, updatedAt: new Date() },
+      { upsert: true }
+    );
+  } catch (err) {
+    console.error('Warning: Could not save settings to DB:', err.message);
+  }
+}
 
 /* =========================
    🔥 5 SEPARATE QUEUES + FLAGS
@@ -71,13 +115,12 @@ let isExecutingShares = false;
 let isExecutingSaves = false;
 let isExecutingComments = false;
 
-// 🔥 Cooldown tracker - prevents sending same link+label too fast
+// 🔥 Cooldown tracker
 const lastExecutionTime = new Map();
 const MIN_COOLDOWN_MS = 10 * 60 * 1000; // 10 minutes
 
 /* =========================
    🔥 START SERVER FIRST
-   So Render always detects port
 ========================= */
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`========================================`);
@@ -96,7 +139,10 @@ mongoose.connect(MONGODB_URI, {
 .then(async () => {
   console.log('✅ MongoDB Connected Successfully');
 
-  // 🔥 Clean truly stuck runs on startup (older than 15 min)
+  // 🔥 Load settings from DB first
+  await loadSettings();
+
+  // 🔥 Clean truly stuck runs on startup
   try {
     const fifteenMinAgo = new Date(Date.now() - 15 * 60 * 1000);
     const cleanResult = await Run.updateMany(
@@ -109,6 +155,16 @@ mongoose.connect(MONGODB_URI, {
     );
     if (cleanResult.modifiedCount > 0) {
       console.log(`✅ Cleaned ${cleanResult.modifiedCount} stuck runs on startup`);
+    }
+
+    // 🔥 FIX BUG 2: Reset any queued runs back to pending on startup
+    // because in-memory queues are lost on restart
+    const queuedClean = await Run.updateMany(
+      { status: 'queued' },
+      { $set: { status: 'pending' } }
+    );
+    if (queuedClean.modifiedCount > 0) {
+      console.log(`✅ Reset ${queuedClean.modifiedCount} queued runs to pending on startup`);
     }
   } catch (err) {
     console.error('Warning: Could not clean stuck runs:', err.message);
@@ -137,6 +193,7 @@ async function placeOrder({ apiUrl, apiKey, service, link, quantity, comments })
 
   const response = await axios.post(apiUrl, params.toString(), {
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    timeout: 30000, // 🔥 FIX: 30 second timeout to prevent hanging
   });
 
   return response.data;
@@ -156,9 +213,12 @@ async function addRuns(services, baseConfig, schedulerOrderId) {
     for (const run of serviceConfig.runs) {
       let quantity;
 
-      // VIEWS
+      // 🔥 FIX BUG 1: Use MIN_VIEWS_PER_RUN variable instead of hardcoded 100
       if (label === 'VIEWS') {
-        if (!run.quantity || run.quantity < 100) continue;
+        if (!run.quantity || run.quantity < MIN_VIEWS_PER_RUN) {
+          console.log(`[SKIP VIEWS RUN] quantity ${run.quantity} < MIN_VIEWS_PER_RUN ${MIN_VIEWS_PER_RUN}`);
+          continue;
+        }
         quantity = run.quantity;
       }
 
@@ -171,10 +231,8 @@ async function addRuns(services, baseConfig, schedulerOrderId) {
           .map(c => c.trim())
           .filter(c => c.length > 0);
 
-        // 🔥 minimum 1 line (was 5, too strict)
         if (lines.length < 1) continue;
 
-        // 🔥 Limit max to 10
         if (lines.length > 10) {
           lines = lines.sort(() => Math.random() - 0.5).slice(0, 10);
         }
@@ -189,6 +247,32 @@ async function addRuns(services, baseConfig, schedulerOrderId) {
         quantity = run.quantity;
       }
 
+      // 🔥 FIX BUG 2: Store time as proper UTC Date object
+      // Parse the time string and ensure it's stored correctly
+      let scheduledTime;
+      try {
+        scheduledTime = new Date(run.time);
+        // Validate the date
+        if (isNaN(scheduledTime.getTime())) {
+          console.error(`[ADD RUNS] Invalid time for run: ${run.time}, skipping`);
+          continue;
+        }
+        // 🔥 Ensure future runs are not in the past due to processing delay
+        const nowMs = Date.now();
+        if (scheduledTime.getTime() < nowMs) {
+          // If time is already past, skip for non-immediate runs
+          // (first run is allowed to be immediate)
+          const isPastByMoreThan5Min = (nowMs - scheduledTime.getTime()) > 5 * 60 * 1000;
+          if (isPastByMoreThan5Min) {
+            console.log(`[ADD RUNS] Skipping past run scheduled at ${scheduledTime.toISOString()}`);
+            continue;
+          }
+        }
+      } catch (err) {
+        console.error(`[ADD RUNS] Error parsing time: ${run.time}`, err);
+        continue;
+      }
+
       const runData = new Run({
         id: Date.now() + Math.random(),
         schedulerOrderId,
@@ -198,7 +282,7 @@ async function addRuns(services, baseConfig, schedulerOrderId) {
         service: serviceConfig.serviceId,
         link: baseConfig.link,
         quantity: quantity,
-        time: run.time,
+        time: scheduledTime, // 🔥 FIX: Use validated Date object
         done: false,
         status: 'pending',
         smmOrderId: null,
@@ -232,7 +316,7 @@ async function executeRun(run) {
   }
 
   try {
-    // 🔥 FIX 1: Only clean truly stuck runs (older than 15 min with no executedAt)
+    // 🔥 Clean stuck runs
     const fifteenMinAgo = new Date(Date.now() - 15 * 60 * 1000);
     await Run.updateMany(
       {
@@ -243,7 +327,7 @@ async function executeRun(run) {
       { $set: { status: 'failed', error: 'Stuck run cleaned up' } }
     );
 
-    // 🔥 FIX 2: Check across ALL orders for same link+label (not just same order)
+    // 🔥 Check for same type already processing for this link
     const activeSameType = await Run.findOne({
       link: run.link,
       label: run.label,
@@ -267,6 +351,17 @@ async function executeRun(run) {
     }
 
     if (!run.quantity || run.quantity <= 0) return;
+
+    // 🔥 FIX BUG 1: Extra check - reject views runs below minimum
+    if (run.label === 'VIEWS' && run.quantity < MIN_VIEWS_PER_RUN) {
+      console.log(`[VIEWS] Skipping run with quantity ${run.quantity} < MIN_VIEWS_PER_RUN ${MIN_VIEWS_PER_RUN}`);
+      await Run.updateOne(
+        { _id: run._id },
+        { $set: { status: 'cancelled', error: `Below minimum views per run (${MIN_VIEWS_PER_RUN})` } }
+      );
+      await updateOrderStatus(run.schedulerOrderId);
+      return;
+    }
 
     console.log(`[${run.label}] Executing run #${run.id}, quantity: ${run.quantity}`);
 
@@ -310,7 +405,6 @@ async function executeRun(run) {
       console.error(`[${run.label}] FAILED`, result);
       const errorMsg = result?.error || 'Unknown error';
 
-      // 🔥 FIX 3: If provider says active order exists, retry after 5 min
       if (errorMsg.toLowerCase().includes('active order') ||
           errorMsg.toLowerCase().includes('wait until')) {
         console.log(`[${run.label}] Provider busy - resetting to pending, retry in 5 min`);
@@ -337,7 +431,6 @@ async function executeRun(run) {
     const errorMsg = err.response?.data?.error || err.message;
 
     if (run?._id) {
-      // 🔥 FIX 4: Retry on provider busy error in catch block too
       if (errorMsg?.toLowerCase?.()?.includes?.('active order') ||
           errorMsg?.toLowerCase?.()?.includes?.('wait until')) {
         console.log(`[${run.label}] Provider busy (catch) - resetting to pending`);
@@ -374,7 +467,6 @@ async function updateOrderStatus(schedulerOrderId) {
 
   if (!order) return;
 
-  // 🔥 Don't overwrite cancelled orders
   if (order.status === 'cancelled') return;
 
   const totalRuns = orderRuns.length;
@@ -442,7 +534,6 @@ async function processViewsQueue() {
       viewsQueue.unshift(run);
       isExecutingViews = false;
       await new Promise(resolve => setTimeout(resolve, Math.min(waitMs, 60000)));
-      // 🔥 Resume queue after cooldown
       if (viewsQueue.length > 0) setImmediate(() => processViewsQueue());
       return;
     }
@@ -485,7 +576,6 @@ async function processLikesQueue() {
       likesQueue.unshift(run);
       isExecutingLikes = false;
       await new Promise(resolve => setTimeout(resolve, Math.min(waitMs, 60000)));
-      // 🔥 Resume queue after cooldown
       if (likesQueue.length > 0) setImmediate(() => processLikesQueue());
       return;
     }
@@ -528,7 +618,6 @@ async function processSharesQueue() {
       sharesQueue.unshift(run);
       isExecutingShares = false;
       await new Promise(resolve => setTimeout(resolve, Math.min(waitMs, 60000)));
-      // 🔥 Resume queue after cooldown
       if (sharesQueue.length > 0) setImmediate(() => processSharesQueue());
       return;
     }
@@ -571,7 +660,6 @@ async function processSavesQueue() {
       savesQueue.unshift(run);
       isExecutingSaves = false;
       await new Promise(resolve => setTimeout(resolve, Math.min(waitMs, 60000)));
-      // 🔥 Resume queue after cooldown
       if (savesQueue.length > 0) setImmediate(() => processSavesQueue());
       return;
     }
@@ -614,7 +702,6 @@ async function processCommentsQueue() {
       commentsQueue.unshift(run);
       isExecutingComments = false;
       await new Promise(resolve => setTimeout(resolve, Math.min(waitMs, 60000)));
-      // 🔥 Resume queue after cooldown
       if (commentsQueue.length > 0) setImmediate(() => processCommentsQueue());
       return;
     }
@@ -657,7 +744,10 @@ mongoose.connection.once('open', () => {
 
   setInterval(async () => {
     try {
-      const now = Date.now();
+      // 🔥 FIX BUG 2: Use server UTC time explicitly
+      const now = new Date();
+      const nowMs = now.getTime();
+
       let addedToQueue = { views: 0, likes: 0, shares: 0, saves: 0, comments: 0 };
 
       const allRuns = await Run.find({ 
@@ -673,15 +763,51 @@ mongoose.connection.once('open', () => {
           continue;
         }
 
-        const runTime = new Date(run.time).getTime();
+        // 🔥 FIX BUG 2: Safely parse run time
+        let runTimeMs;
+        try {
+          // MongoDB stores Date objects - getTime() is safe
+          runTimeMs = run.time instanceof Date 
+            ? run.time.getTime() 
+            : new Date(run.time).getTime();
 
-        if (runTime <= now && run.status === 'pending') {
+          if (isNaN(runTimeMs)) {
+            console.error(`[SCHEDULER] Invalid run time for run #${run.id}: ${run.time}`);
+            continue;
+          }
+        } catch (err) {
+          console.error(`[SCHEDULER] Error parsing run time for run #${run.id}:`, err);
+          continue;
+        }
+
+        // 🔥 FIX BUG 2: Only execute if current time >= scheduled time
+        // Added 1 second buffer to prevent floating point issues
+        const isTimeReached = runTimeMs <= (nowMs + 1000);
+
+        if (isTimeReached && run.status === 'pending') {
+
+          // 🔥 FIX BUG 1: Check minimum views before queuing
+          if (run.label === 'VIEWS' && run.quantity < MIN_VIEWS_PER_RUN) {
+            console.log(`[SCHEDULER] Skipping VIEWS run #${run.id} - quantity ${run.quantity} < MIN ${MIN_VIEWS_PER_RUN}`);
+            await Run.updateOne(
+              { _id: run._id },
+              { 
+                $set: { 
+                  status: 'cancelled', 
+                  done: true,
+                  error: `Below minimum views per run (${MIN_VIEWS_PER_RUN})`
+                } 
+              }
+            );
+            continue;
+          }
+
           if (run.label === 'VIEWS') {
             viewsQueue.push(run);
             run.status = 'queued';
             await run.save();
             addedToQueue.views++;
-            console.log(`[SCHEDULER] Added VIEWS run #${run.id} to queue (qty: ${run.quantity})`);
+            console.log(`[SCHEDULER] Added VIEWS run #${run.id} to queue (qty: ${run.quantity}, scheduled: ${run.time.toISOString()})`);
           } else if (run.label === 'LIKES') {
             likesQueue.push(run);
             run.status = 'queued';
@@ -782,6 +908,7 @@ app.post('/api/services', async (req, res) => {
     const params = new URLSearchParams({ key: apiKey, action: 'services' });
     const response = await axios.post(apiUrl, params.toString(), {
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      timeout: 30000,
     });
     return res.json(response.data);
   } catch (error) {
@@ -906,7 +1033,6 @@ app.post('/api/order/control', async (req, res) => {
           likesQueue = likesQueue.filter(r => r.id !== run.id);
           sharesQueue = sharesQueue.filter(r => r.id !== run.id);
           savesQueue = savesQueue.filter(r => r.id !== run.id);
-          // 🔥 Fix: also remove from commentsQueue
           commentsQueue = commentsQueue.filter(r => r.id !== run.id);
         }
       }
@@ -967,16 +1093,21 @@ app.get('/api/order/runs/:schedulerOrderId', async (req, res) => {
   }
 });
 
-app.get('/api/settings/min-views', (req, res) => {
+// 🔥 FIX BUG 1: Now saves to MongoDB so it persists across restarts
+app.get('/api/settings/min-views', async (req, res) => {
   return res.json({ minViewsPerRun: MIN_VIEWS_PER_RUN });
 });
 
-app.post('/api/settings/min-views', (req, res) => {
+app.post('/api/settings/min-views', async (req, res) => {
   const { minViewsPerRun } = req.body;
   if (typeof minViewsPerRun !== 'number' || minViewsPerRun < 1) {
     return res.status(400).json({ error: 'Invalid minViewsPerRun value' });
   }
   MIN_VIEWS_PER_RUN = Math.floor(minViewsPerRun);
+  
+  // 🔥 FIX: Save to MongoDB so it persists across restarts
+  await saveMinViewsSetting(MIN_VIEWS_PER_RUN);
+  
   console.log(`Minimum views per run updated to: ${MIN_VIEWS_PER_RUN}`);
   return res.json({ success: true, minViewsPerRun: MIN_VIEWS_PER_RUN });
 });
@@ -1006,12 +1137,9 @@ app.get('/api/queues/status', (req, res) => {
     comments: {
       queueLength: commentsQueue.length,
       isExecuting: isExecutingComments,
-      pending: commentsQueue.map(r => ({
-        id: r.id,
-        quantity: r.quantity,
-        time: r.time
-      }))
-    }
+      pending: commentsQueue.map(r => ({ id: r.id, quantity: r.quantity, time: r.time }))
+    },
+    minViewsPerRun: MIN_VIEWS_PER_RUN,
   });
 });
 
@@ -1023,7 +1151,7 @@ app.post('/api/runs/retry-stuck', async (req, res) => {
     const allRuns = await Run.find({ done: false });
 
     for (let run of allRuns) {
-      const runTime = new Date(run.time).getTime();
+      const runTime = run.time instanceof Date ? run.time.getTime() : new Date(run.time).getTime();
       if (runTime <= now && run.status === 'pending') {
         resetCount++;
       }
@@ -1056,9 +1184,22 @@ app.post('/api/scheduler/trigger', async (req, res) => {
 
     for (let run of allRuns) {
       if (isRunInQueue(run.id)) continue;
-      const runTime = new Date(run.time).getTime();
+      
+      const runTimeMs = run.time instanceof Date 
+        ? run.time.getTime() 
+        : new Date(run.time).getTime();
 
-      if (runTime <= now && run.status === 'pending') {
+      if (runTimeMs <= (now + 1000) && run.status === 'pending') {
+
+        // 🔥 FIX BUG 1: Check minimum views before queuing
+        if (run.label === 'VIEWS' && run.quantity < MIN_VIEWS_PER_RUN) {
+          await Run.updateOne(
+            { _id: run._id },
+            { $set: { status: 'cancelled', done: true, error: `Below minimum views per run (${MIN_VIEWS_PER_RUN})` } }
+          );
+          continue;
+        }
+
         if (run.label === 'VIEWS') {
           viewsQueue.push(run);
           run.status = 'queued';
@@ -1097,6 +1238,7 @@ app.post('/api/scheduler/trigger', async (req, res) => {
     return res.json({
       success: true,
       addedToQueue,
+      minViewsPerRun: MIN_VIEWS_PER_RUN,
       currentQueues: {
         views: viewsQueue.length,
         likes: likesQueue.length,
@@ -1115,6 +1257,7 @@ app.get('/api/health', (req, res) => {
     status: 'ok',
     mongoConnected: mongoose.connection.readyState === 1,
     uptime: process.uptime(),
+    minViewsPerRun: MIN_VIEWS_PER_RUN,
     queues: {
       views: viewsQueue.length,
       likes: likesQueue.length,

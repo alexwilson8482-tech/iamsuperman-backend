@@ -1,10 +1,8 @@
-// Increase memory limit safely (optional)
-require('v8').setFlagsFromString('--max_old_space_size=1024');
-
 const express = require('express'); 
 const cors = require('cors');
 const axios = require('axios');
 const mongoose = require('mongoose');
+
 const app = express();
 const PORT = process.env.PORT || 5000; 
 
@@ -18,8 +16,8 @@ const MONGODB_URI = process.env.MONGODB_URI || 'mongodb+srv://harshaffiliate16_d
 
 /* =========================
    🔥 MONGODB SCHEMAS
+   ✅ FIX: index() AFTER schema definition
 ========================= */
-RunSchema.index({ status: 1, time: 1 });
 const RunSchema = new mongoose.Schema({
   id: { type: Number, required: true, index: true },
   schedulerOrderId: { type: String, required: true, index: true },
@@ -39,6 +37,10 @@ const RunSchema = new mongoose.Schema({
   comments: { type: String, default: null },
 });
 
+// ✅ FIX: index AFTER schema is defined
+RunSchema.index({ status: 1, time: 1 });
+RunSchema.index({ done: 1, status: 1, time: 1 });
+
 const OrderSchema = new mongoose.Schema({
   schedulerOrderId: { type: String, required: true, unique: true, index: true },
   name: { type: String, required: true },
@@ -51,7 +53,6 @@ const OrderSchema = new mongoose.Schema({
   lastUpdatedAt: { type: Date, default: Date.now },
 });
 
-// 🔥 NEW: Settings schema to persist MIN_VIEWS_PER_RUN in MongoDB
 const SettingsSchema = new mongoose.Schema({
   key: { type: String, required: true, unique: true },
   value: { type: mongoose.Schema.Types.Mixed, required: true },
@@ -64,12 +65,9 @@ const Settings = mongoose.model('Settings', SettingsSchema);
 
 /* =========================
    MINIMUM VIEWS PER RUN
-   🔥 FIX: Now persisted in MongoDB
-   so it survives server restarts
 ========================= */
 let MIN_VIEWS_PER_RUN = 100;
 
-// 🔥 Load MIN_VIEWS_PER_RUN from MongoDB on startup
 async function loadSettings() {
   try {
     const setting = await Settings.findOne({ key: 'minViewsPerRun' });
@@ -77,7 +75,6 @@ async function loadSettings() {
       MIN_VIEWS_PER_RUN = setting.value;
       console.log(`✅ Loaded MIN_VIEWS_PER_RUN from DB: ${MIN_VIEWS_PER_RUN}`);
     } else {
-      // Save default value
       await Settings.findOneAndUpdate(
         { key: 'minViewsPerRun' },
         { key: 'minViewsPerRun', value: MIN_VIEWS_PER_RUN, updatedAt: new Date() },
@@ -90,7 +87,6 @@ async function loadSettings() {
   }
 }
 
-// 🔥 Save MIN_VIEWS_PER_RUN to MongoDB
 async function saveMinViewsSetting(value) {
   try {
     await Settings.findOneAndUpdate(
@@ -118,9 +114,8 @@ let isExecutingShares = false;
 let isExecutingSaves = false;
 let isExecutingComments = false;
 
-// 🔥 Cooldown tracker
 const lastExecutionTime = new Map();
-const MIN_COOLDOWN_MS = 10 * 60 * 1000; // 10 minutes
+const MIN_COOLDOWN_MS = 10 * 60 * 1000;
 
 /* =========================
    🔥 START SERVER FIRST
@@ -134,7 +129,7 @@ app.listen(PORT, '0.0.0.0', () => {
 });
 
 /* =========================
-   🔥 THEN CONNECT MONGODB
+   🔥 CONNECT MONGODB
 ========================= */
 mongoose.connect(MONGODB_URI, {
   serverSelectionTimeoutMS: 30000,
@@ -142,10 +137,8 @@ mongoose.connect(MONGODB_URI, {
 .then(async () => {
   console.log('✅ MongoDB Connected Successfully');
 
-  // 🔥 Load settings from DB first
   await loadSettings();
 
-  // 🔥 Clean truly stuck runs on startup
   try {
     const fifteenMinAgo = new Date(Date.now() - 15 * 60 * 1000);
     const cleanResult = await Run.updateMany(
@@ -160,8 +153,6 @@ mongoose.connect(MONGODB_URI, {
       console.log(`✅ Cleaned ${cleanResult.modifiedCount} stuck runs on startup`);
     }
 
-    // 🔥 FIX BUG 2: Reset any queued runs back to pending on startup
-    // because in-memory queues are lost on restart
     const queuedClean = await Run.updateMany(
       { status: 'queued' },
       { $set: { status: 'pending' } }
@@ -196,7 +187,7 @@ async function placeOrder({ apiUrl, apiKey, service, link, quantity, comments })
 
   const response = await axios.post(apiUrl, params.toString(), {
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    timeout: 30000, // 🔥 FIX: 30 second timeout to prevent hanging
+    timeout: 30000,
   });
 
   return response.data;
@@ -216,17 +207,13 @@ async function addRuns(services, baseConfig, schedulerOrderId) {
     for (const run of serviceConfig.runs) {
       let quantity;
 
-      // 🔥 FIX BUG 1: Use MIN_VIEWS_PER_RUN variable instead of hardcoded 100
       if (label === 'VIEWS') {
         if (!run.quantity || run.quantity < MIN_VIEWS_PER_RUN) {
           console.log(`[SKIP VIEWS RUN] quantity ${run.quantity} < MIN_VIEWS_PER_RUN ${MIN_VIEWS_PER_RUN}`);
           continue;
         }
         quantity = run.quantity;
-      }
-
-      // COMMENTS
-      else if (label === 'COMMENTS') {
+      } else if (label === 'COMMENTS') {
         if (!run.comments) continue;
 
         let lines = run.comments
@@ -242,29 +229,20 @@ async function addRuns(services, baseConfig, schedulerOrderId) {
 
         run.comments = lines.join('\n');
         quantity = lines.length;
-      }
-
-      // OTHERS (likes, shares, saves)
-      else {
+      } else {
         if (!run.quantity || run.quantity <= 0) continue;
         quantity = run.quantity;
       }
 
-      // 🔥 FIX BUG 2: Store time as proper UTC Date object
-      // Parse the time string and ensure it's stored correctly
       let scheduledTime;
       try {
         scheduledTime = new Date(run.time);
-        // Validate the date
         if (isNaN(scheduledTime.getTime())) {
           console.error(`[ADD RUNS] Invalid time for run: ${run.time}, skipping`);
           continue;
         }
-        // 🔥 Ensure future runs are not in the past due to processing delay
         const nowMs = Date.now();
         if (scheduledTime.getTime() < nowMs) {
-          // If time is already past, skip for non-immediate runs
-          // (first run is allowed to be immediate)
           const isPastByMoreThan5Min = (nowMs - scheduledTime.getTime()) > 5 * 60 * 1000;
           if (isPastByMoreThan5Min) {
             console.log(`[ADD RUNS] Skipping past run scheduled at ${scheduledTime.toISOString()}`);
@@ -285,7 +263,7 @@ async function addRuns(services, baseConfig, schedulerOrderId) {
         service: serviceConfig.serviceId,
         link: baseConfig.link,
         quantity: quantity,
-        time: scheduledTime, // 🔥 FIX: Use validated Date object
+        time: scheduledTime,
         done: false,
         status: 'pending',
         smmOrderId: null,
@@ -307,7 +285,6 @@ async function addRuns(services, baseConfig, schedulerOrderId) {
    EXECUTE RUN
 ========================= */
 async function executeRun(run) {
-  // 🔥 STOP IF ORDER CANCELLED
   const order = await Order.findOne({ schedulerOrderId: run.schedulerOrderId });
   if (run.status === 'cancelled') {
     console.log(`[SKIP] Run already cancelled`);
@@ -319,18 +296,12 @@ async function executeRun(run) {
   }
 
   try {
-    // 🔥 Clean stuck runs
     const fifteenMinAgo = new Date(Date.now() - 15 * 60 * 1000);
     await Run.updateMany(
-      {
-        status: 'processing',
-        executedAt: null,
-        createdAt: { $lt: fifteenMinAgo }
-      },
+      { status: 'processing', executedAt: null, createdAt: { $lt: fifteenMinAgo } },
       { $set: { status: 'failed', error: 'Stuck run cleaned up' } }
     );
 
-    // 🔥 Check for same type already processing for this link
     const activeSameType = await Run.findOne({
       link: run.link,
       label: run.label,
@@ -355,7 +326,6 @@ async function executeRun(run) {
 
     if (!run.quantity || run.quantity <= 0) return;
 
-    // 🔥 FIX BUG 1: Extra check - reject views runs below minimum
     if (run.label === 'VIEWS' && run.quantity < MIN_VIEWS_PER_RUN) {
       console.log(`[VIEWS] Skipping run with quantity ${run.quantity} < MIN_VIEWS_PER_RUN ${MIN_VIEWS_PER_RUN}`);
       await Run.updateOne(
@@ -465,11 +435,11 @@ async function executeRun(run) {
 async function updateOrderStatus(schedulerOrderId) {
   if (!schedulerOrderId) return;
 
-  const orderRuns = await Run.find({ schedulerOrderId });
+  // ✅ Use .lean() here - we only need plain data for counting
+  const orderRuns = await Run.find({ schedulerOrderId }).lean();
   const order = await Order.findOne({ schedulerOrderId });
 
   if (!order) return;
-
   if (order.status === 'cancelled') return;
 
   const totalRuns = orderRuns.length;
@@ -541,6 +511,7 @@ async function processViewsQueue() {
       return;
     }
 
+    // ✅ Fetch fresh mongoose document (not lean) so we can update it
     const freshRun = await Run.findById(run._id);
     if (!freshRun || freshRun.status === 'cancelled') {
       console.log(`[VIEWS QUEUE] Skipped cancelled run`);
@@ -741,40 +712,44 @@ function isRunInQueue(runId) {
 
 /* =========================
    🔥 MAIN SCHEDULER
+   ✅ FIX: .lean() + .limit() for memory
+   ✅ FIX: updateOne instead of run.save()
 ========================= */
 mongoose.connection.once('open', () => {
   console.log("🚀 Scheduler started after DB connected");
 
   setInterval(async () => {
     try {
-      // 🔥 FIX BUG 2: Use server UTC time explicitly
       const now = new Date();
       const nowMs = now.getTime();
 
       let addedToQueue = { views: 0, likes: 0, shares: 0, saves: 0, comments: 0 };
 
+      // ✅ FIX: Only load runs due NOW, limit 200, use lean()
       const allRuns = await Run.find({
-  done: false,
-  status: 'pending',
-  time: { $lte: new Date() } // only runs that should execute now
-})
-.limit(200) // 🔥 CRITICAL: prevent memory explosion
-.lean();     // 🔥 CRITICAL: use plain objects (less memory)
+        done: false,
+        status: 'pending',
+        time: { $lte: now }
+      })
+      .limit(200)
+      .lean(); // ✅ plain objects - memory safe
 
       for (let run of allRuns) {
-        if (run.status === 'queued' || isRunInQueue(run.id)) continue;
+        if (isRunInQueue(run.id)) continue;
 
-        const order = await Order.findOne({ schedulerOrderId: run.schedulerOrderId });
-        if (!order || order.status === 'cancelled') {
-          continue;
-        }
+        // ✅ Use lean for order check too
+        const order = await Order.findOne(
+          { schedulerOrderId: run.schedulerOrderId },
+          { status: 1 }  // only fetch status field
+        ).lean();
 
-        // 🔥 FIX BUG 2: Safely parse run time
+        if (!order || order.status === 'cancelled') continue;
+
+        // Validate run time
         let runTimeMs;
         try {
-          // MongoDB stores Date objects - getTime() is safe
-          runTimeMs = run.time instanceof Date 
-            ? run.time.getTime() 
+          runTimeMs = run.time instanceof Date
+            ? run.time.getTime()
             : new Date(run.time).getTime();
 
           if (isNaN(runTimeMs)) {
@@ -786,56 +761,45 @@ mongoose.connection.once('open', () => {
           continue;
         }
 
-        // 🔥 FIX BUG 2: Only execute if current time >= scheduled time
-        // Added 1 second buffer to prevent floating point issues
         const isTimeReached = runTimeMs <= (nowMs + 1000);
 
-        if (isTimeReached && run.status === 'pending') {
+        if (isTimeReached) {
 
-          // 🔥 FIX BUG 1: Check minimum views before queuing
+          // Check minimum views
           if (run.label === 'VIEWS' && run.quantity < MIN_VIEWS_PER_RUN) {
             console.log(`[SCHEDULER] Skipping VIEWS run #${run.id} - quantity ${run.quantity} < MIN ${MIN_VIEWS_PER_RUN}`);
+            // ✅ FIX: updateOne instead of run.save() (lean objects have no save())
             await Run.updateOne(
               { _id: run._id },
-              { 
-                $set: { 
-                  status: 'cancelled', 
-                  done: true,
-                  error: `Below minimum views per run (${MIN_VIEWS_PER_RUN})`
-                } 
-              }
+              { $set: { status: 'cancelled', done: true, error: `Below minimum views per run (${MIN_VIEWS_PER_RUN})` } }
             );
             continue;
           }
 
+          // ✅ FIX: updateOne instead of run.save()
+          await Run.updateOne(
+            { _id: run._id },
+            { $set: { status: 'queued' } }
+          );
+
           if (run.label === 'VIEWS') {
             viewsQueue.push(run);
-            run.status = 'queued';
-            await run.save();
             addedToQueue.views++;
-            console.log(`[SCHEDULER] Added VIEWS run #${run.id} to queue (qty: ${run.quantity}, scheduled: ${run.time.toISOString()})`);
+            console.log(`[SCHEDULER] Added VIEWS run #${run.id} to queue (qty: ${run.quantity})`);
           } else if (run.label === 'LIKES') {
             likesQueue.push(run);
-            run.status = 'queued';
-            await run.save();
             addedToQueue.likes++;
             console.log(`[SCHEDULER] Added LIKES run #${run.id} to queue (qty: ${run.quantity})`);
           } else if (run.label === 'SHARES') {
             sharesQueue.push(run);
-            run.status = 'queued';
-            await run.save();
             addedToQueue.shares++;
             console.log(`[SCHEDULER] Added SHARES run #${run.id} to queue (qty: ${run.quantity})`);
           } else if (run.label === 'SAVES') {
             savesQueue.push(run);
-            run.status = 'queued';
-            await run.save();
             addedToQueue.saves++;
             console.log(`[SCHEDULER] Added SAVES run #${run.id} to queue (qty: ${run.quantity})`);
           } else if (run.label === 'COMMENTS') {
             commentsQueue.push(run);
-            run.status = 'queued';
-            await run.save();
             addedToQueue.comments++;
             console.log(`[SCHEDULER] Added COMMENTS run #${run.id} to queue (qty: ${run.quantity})`);
           }
@@ -843,7 +807,7 @@ mongoose.connection.once('open', () => {
       }
 
       if (addedToQueue.views + addedToQueue.likes + addedToQueue.shares + addedToQueue.saves + addedToQueue.comments > 0) {
-        console.log(`[SCHEDULER] Added to queues - Views: ${addedToQueue.views}, Likes: ${addedToQueue.likes}, Shares: ${addedToQueue.shares}, Saves: ${addedToQueue.saves}, Comments: ${addedToQueue.comments}`);
+        console.log(`[SCHEDULER] Added - Views: ${addedToQueue.views}, Likes: ${addedToQueue.likes}, Shares: ${addedToQueue.shares}, Saves: ${addedToQueue.saves}, Comments: ${addedToQueue.comments}`);
       }
 
       if (viewsQueue.length > 0 && !isExecutingViews) processViewsQueue();
@@ -869,8 +833,6 @@ app.post('/api/order', async (req, res) => {
     if (!apiUrl || !apiKey || !link || !services) {
       return res.status(400).json({ error: 'Missing required fields' });
     }
-
-    console.log('Creating new order...');
 
     const schedulerOrderId = `sched-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
     const runsForOrder = await addRuns(services, { apiUrl, apiKey, link }, schedulerOrderId);
@@ -925,8 +887,8 @@ app.post('/api/services', async (req, res) => {
 app.get('/api/order/status/:schedulerOrderId', async (req, res) => {
   try {
     const { schedulerOrderId } = req.params;
-    const order = await Order.findOne({ schedulerOrderId });
-    const orderRuns = await Run.find({ schedulerOrderId });
+    const order = await Order.findOne({ schedulerOrderId }).lean();
+    const orderRuns = await Run.find({ schedulerOrderId }).lean();
 
     if (!order) {
       return res.status(404).json({ error: 'Order not found' });
@@ -960,9 +922,13 @@ app.get('/api/order/status/:schedulerOrderId', async (req, res) => {
 
 app.get('/api/orders/status', async (req, res) => {
   try {
-    const allOrders = await Order.find().sort({ createdAt: -1 });
+    // ✅ Use lean() for read-only endpoints
+    const allOrders = await Order.find().sort({ createdAt: -1 }).lean();
     const ordersWithRuns = await Promise.all(allOrders.map(async (order) => {
-      const orderRuns = await Run.find({ schedulerOrderId: order.schedulerOrderId });
+      const orderRuns = await Run.find(
+        { schedulerOrderId: order.schedulerOrderId },
+        { id: 1, label: 1, quantity: 1, time: 1, status: 1, smmOrderId: 1 }
+      ).lean();
       return {
         schedulerOrderId: order.schedulerOrderId,
         name: order.name,
@@ -973,14 +939,7 @@ app.get('/api/orders/status', async (req, res) => {
         runStatuses: order.runStatuses,
         createdAt: order.createdAt,
         lastUpdatedAt: order.lastUpdatedAt,
-        runs: orderRuns.map(r => ({
-          id: r.id,
-          label: r.label,
-          quantity: r.quantity,
-          time: r.time,
-          status: r.status,
-          smmOrderId: r.smmOrderId,
-        })),
+        runs: orderRuns,
       };
     }));
 
@@ -1080,7 +1039,7 @@ app.post('/api/order/control', async (req, res) => {
 app.get('/api/order/runs/:schedulerOrderId', async (req, res) => {
   try {
     const { schedulerOrderId } = req.params;
-    const orderRuns = await Run.find({ schedulerOrderId });
+    const orderRuns = await Run.find({ schedulerOrderId }).lean();
     return res.json({
       schedulerOrderId,
       runs: orderRuns.map(r => ({
@@ -1099,7 +1058,6 @@ app.get('/api/order/runs/:schedulerOrderId', async (req, res) => {
   }
 });
 
-// 🔥 FIX BUG 1: Now saves to MongoDB so it persists across restarts
 app.get('/api/settings/min-views', async (req, res) => {
   return res.json({ minViewsPerRun: MIN_VIEWS_PER_RUN });
 });
@@ -1110,63 +1068,32 @@ app.post('/api/settings/min-views', async (req, res) => {
     return res.status(400).json({ error: 'Invalid minViewsPerRun value' });
   }
   MIN_VIEWS_PER_RUN = Math.floor(minViewsPerRun);
-  
-  // 🔥 FIX: Save to MongoDB so it persists across restarts
   await saveMinViewsSetting(MIN_VIEWS_PER_RUN);
-  
   console.log(`Minimum views per run updated to: ${MIN_VIEWS_PER_RUN}`);
   return res.json({ success: true, minViewsPerRun: MIN_VIEWS_PER_RUN });
 });
 
 app.get('/api/queues/status', (req, res) => {
   return res.json({
-    views: {
-      queueLength: viewsQueue.length,
-      isExecuting: isExecutingViews,
-      pending: viewsQueue.map(r => ({ id: r.id, quantity: r.quantity, time: r.time }))
-    },
-    likes: {
-      queueLength: likesQueue.length,
-      isExecuting: isExecutingLikes,
-      pending: likesQueue.map(r => ({ id: r.id, quantity: r.quantity, time: r.time }))
-    },
-    shares: {
-      queueLength: sharesQueue.length,
-      isExecuting: isExecutingShares,
-      pending: sharesQueue.map(r => ({ id: r.id, quantity: r.quantity, time: r.time }))
-    },
-    saves: {
-      queueLength: savesQueue.length,
-      isExecuting: isExecutingSaves,
-      pending: savesQueue.map(r => ({ id: r.id, quantity: r.quantity, time: r.time }))
-    },
-    comments: {
-      queueLength: commentsQueue.length,
-      isExecuting: isExecutingComments,
-      pending: commentsQueue.map(r => ({ id: r.id, quantity: r.quantity, time: r.time }))
-    },
+    views: { queueLength: viewsQueue.length, isExecuting: isExecutingViews },
+    likes: { queueLength: likesQueue.length, isExecuting: isExecutingLikes },
+    shares: { queueLength: sharesQueue.length, isExecuting: isExecutingShares },
+    saves: { queueLength: savesQueue.length, isExecuting: isExecutingSaves },
+    comments: { queueLength: commentsQueue.length, isExecuting: isExecutingComments },
     minViewsPerRun: MIN_VIEWS_PER_RUN,
   });
 });
 
 app.post('/api/runs/retry-stuck', async (req, res) => {
   try {
-    const now = Date.now();
     let resetCount = 0;
 
-    const allRuns = await Run.find({ done: false });
-
-    for (let run of allRuns) {
-      const runTime = run.time instanceof Date ? run.time.getTime() : new Date(run.time).getTime();
-      if (runTime <= now && run.status === 'pending') {
-        resetCount++;
-      }
-      if (run.status === 'queued' && !isRunInQueue(run.id)) {
-        run.status = 'pending';
-        await run.save();
-        resetCount++;
-      }
-    }
+    // ✅ Use updateMany instead of loading all runs into memory
+    const queuedResult = await Run.updateMany(
+      { status: 'queued', done: false },
+      { $set: { status: 'pending' } }
+    );
+    resetCount += queuedResult.modifiedCount;
 
     return res.json({
       success: true,
@@ -1180,24 +1107,28 @@ app.post('/api/runs/retry-stuck', async (req, res) => {
 
 app.post('/api/scheduler/trigger', async (req, res) => {
   try {
-    const now = Date.now();
+    const now = new Date();
+    const nowMs = now.getTime();
     let addedToQueue = { views: 0, likes: 0, shares: 0, saves: 0, comments: 0 };
 
-    const allRuns = await Run.find({ 
+    // ✅ Same memory-safe query as main scheduler
+    const allRuns = await Run.find({
       done: false,
-      status: { $nin: ['completed', 'failed', 'cancelled', 'processing', 'queued'] }
-    });
+      status: 'pending',
+      time: { $lte: now }
+    })
+    .limit(200)
+    .lean();
 
     for (let run of allRuns) {
       if (isRunInQueue(run.id)) continue;
-      
-      const runTimeMs = run.time instanceof Date 
-        ? run.time.getTime() 
+
+      const runTimeMs = run.time instanceof Date
+        ? run.time.getTime()
         : new Date(run.time).getTime();
 
-      if (runTimeMs <= (now + 1000) && run.status === 'pending') {
+      if (runTimeMs <= (nowMs + 1000)) {
 
-        // 🔥 FIX BUG 1: Check minimum views before queuing
         if (run.label === 'VIEWS' && run.quantity < MIN_VIEWS_PER_RUN) {
           await Run.updateOne(
             { _id: run._id },
@@ -1206,32 +1137,17 @@ app.post('/api/scheduler/trigger', async (req, res) => {
           continue;
         }
 
-        if (run.label === 'VIEWS') {
-          viewsQueue.push(run);
-          run.status = 'queued';
-          await run.save();
-          addedToQueue.views++;
-        } else if (run.label === 'LIKES') {
-          likesQueue.push(run);
-          run.status = 'queued';
-          await run.save();
-          addedToQueue.likes++;
-        } else if (run.label === 'SHARES') {
-          sharesQueue.push(run);
-          run.status = 'queued';
-          await run.save();
-          addedToQueue.shares++;
-        } else if (run.label === 'SAVES') {
-          savesQueue.push(run);
-          run.status = 'queued';
-          await run.save();
-          addedToQueue.saves++;
-        } else if (run.label === 'COMMENTS') {
-          commentsQueue.push(run);
-          run.status = 'queued';
-          await run.save();
-          addedToQueue.comments++;
-        }
+        // ✅ FIX: updateOne instead of run.save()
+        await Run.updateOne(
+          { _id: run._id },
+          { $set: { status: 'queued' } }
+        );
+
+        if (run.label === 'VIEWS') { viewsQueue.push(run); addedToQueue.views++; }
+        else if (run.label === 'LIKES') { likesQueue.push(run); addedToQueue.likes++; }
+        else if (run.label === 'SHARES') { sharesQueue.push(run); addedToQueue.shares++; }
+        else if (run.label === 'SAVES') { savesQueue.push(run); addedToQueue.saves++; }
+        else if (run.label === 'COMMENTS') { commentsQueue.push(run); addedToQueue.comments++; }
       }
     }
 

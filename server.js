@@ -1,8 +1,10 @@
+// Increase memory limit safely (optional)
+require('v8').setFlagsFromString('--max_old_space_size=1024');
+
 const express = require('express'); 
 const cors = require('cors');
 const axios = require('axios');
 const mongoose = require('mongoose');
- 
 const app = express();
 const PORT = process.env.PORT || 5000; 
 
@@ -17,6 +19,7 @@ const MONGODB_URI = process.env.MONGODB_URI || 'mongodb+srv://harshaffiliate16_d
 /* =========================
    🔥 MONGODB SCHEMAS
 ========================= */
+RunSchema.index({ status: 1, time: 1 });
 const RunSchema = new mongoose.Schema({
   id: { type: Number, required: true, index: true },
   schedulerOrderId: { type: String, required: true, index: true },
@@ -750,10 +753,13 @@ mongoose.connection.once('open', () => {
 
       let addedToQueue = { views: 0, likes: 0, shares: 0, saves: 0, comments: 0 };
 
-      const allRuns = await Run.find({ 
-        done: false,
-        status: { $nin: ['completed', 'failed', 'cancelled', 'processing'] }
-      });
+      const allRuns = await Run.find({
+  done: false,
+  status: 'pending',
+  time: { $lte: new Date() } // only runs that should execute now
+})
+.limit(200) // 🔥 CRITICAL: prevent memory explosion
+.lean();     // 🔥 CRITICAL: use plain objects (less memory)
 
       for (let run of allRuns) {
         if (run.status === 'queued' || isRunInQueue(run.id)) continue;
